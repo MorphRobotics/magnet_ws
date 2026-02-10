@@ -11,7 +11,7 @@ Interactive: click on PRM nodes in the 3D view to set navigation targets.
 Real-time graphs display NN output parameters and tip/magnet positions.
 """
 
-import sys
+import os, sys
 import numpy as np
 import scipy.io as sio
 import onnxruntime as ort
@@ -27,12 +27,12 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 # ──────────────────────────────────────────────────────────────────────────────
 # FILE PATHS (adjust if needed)
 # ──────────────────────────────────────────────────────────────────────────────
-BASE_DIR       = '/home/user/magnet_ws'
-STL_PATH       = f'{BASE_DIR}/Bronchial tree anatomy-1mm-shell (1).STL'
-PRM_PATH       = f'{BASE_DIR}/prm_roadmap.mat'
-OBSTACLE_PATH  = f'{BASE_DIR}/bronchial_obstacle_map.mat'
-ONNX_PATH      = f'{BASE_DIR}/src/magnet_control/magnet_control/mscr_inverse_model.onnx'
-NORM_PATH      = f'{BASE_DIR}/src/magnet_control/magnet_control/inv_norm3.mat'
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+STL_PATH       = os.path.join(BASE_DIR, 'Bronchial tree anatomy-1mm-shell (1).STL')
+PRM_PATH       = os.path.join(BASE_DIR, 'prm_roadmap.mat')
+OBSTACLE_PATH  = os.path.join(BASE_DIR, 'bronchial_obstacle_map.mat')
+ONNX_PATH      = os.path.join(BASE_DIR, 'src', 'magnet_control', 'magnet_control', 'mscr_inverse_model.onnx')
+NORM_PATH      = os.path.join(BASE_DIR, 'src', 'magnet_control', 'magnet_control', 'inv_norm3.mat')
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PHYSICAL CONSTANTS
