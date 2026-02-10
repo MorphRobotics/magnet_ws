@@ -137,6 +137,14 @@ class LungNavigationSim:
         self.magnet_pos = self.current_pos + np.array([MAGNET_OFFSET, 0, 0])
         self.prev_magnet = self.magnet_pos.copy()
 
+        # UR5e robot base position (fixed, offset from the lung)
+        stl_center = self.stl_vectors.reshape(-1, 3).mean(axis=0)
+        stl_extent = self.stl_vectors.reshape(-1, 3).max(axis=0) - self.stl_vectors.reshape(-1, 3).min(axis=0)
+        self.ur5e_base = stl_center + np.array([stl_extent[0] * 0.8, 0.0, stl_extent[2] * 0.3])
+
+        # UR5e link lengths (simplified 3-link model) [mm]
+        self.ur5e_links = [162.5, 425.0, 392.0]  # shoulder-elbow, elbow-wrist, wrist-EE
+
         # History buffers for graphs
         self.max_hist   = 300
         self.hist_B     = deque(maxlen=self.max_hist)
@@ -187,10 +195,13 @@ class LungNavigationSim:
                                 linewidth=0.1)
         ax.add_collection3d(poly)
 
-        # Set axis limits from STL bounds
+        # Set axis limits from STL bounds + UR5e base
         mn = self.stl_vectors.reshape(-1, 3).min(axis=0)
         mx = self.stl_vectors.reshape(-1, 3).max(axis=0)
-        pad = 10
+        # Expand bounds to include UR5e base
+        mn = np.minimum(mn, self.ur5e_base - 50)
+        mx = np.maximum(mx, self.ur5e_base + 50)
+        pad = 20
         ax.set_xlim(mn[0] - pad, mx[0] + pad)
         ax.set_ylim(mn[1] - pad, mx[1] + pad)
         ax.set_zlim(mn[2] - pad, mx[2] + pad)
@@ -323,6 +334,16 @@ class LungNavigationSim:
         interp.append(points[-1])
         return np.array(interp)
 
+    def _find_base_index(self, tip_idx, arc_length):
+        """Walk backwards along the path from tip_idx by arc_length mm."""
+        remaining = arc_length
+        idx = tip_idx
+        while idx > 0 and remaining > 0:
+            seg = np.linalg.norm(self.path_points[idx] - self.path_points[idx - 1])
+            remaining -= seg
+            idx -= 1
+        return max(idx, 0)
+
     # ── Simulation loop ──────────────────────────────────────────────────────
 
     def run(self):
@@ -347,20 +368,25 @@ class LungNavigationSim:
         self.current_pos = self.path_points[self.path_cursor].copy()
         self.path_cursor += 1
 
-        # MSCR base is L_MSCR behind tip along the path tangent
-        if self.path_cursor >= 2:
-            tangent = self.current_pos - self.path_points[max(0, self.path_cursor - 2)]
-            t_norm = np.linalg.norm(tangent)
-            if t_norm > 1e-6:
-                tangent /= t_norm
-            else:
-                tangent = np.array([0, 0, 1.0])
-        else:
-            tangent = np.array([0, 0, 1.0])
-        self.mscr_base = self.current_pos - tangent * L_MSCR
+        # MSCR base trails L_MSCR behind along the actual path arc length
+        base_idx = self._find_base_index(self.path_cursor - 1, L_MSCR)
+        self.mscr_base = self.path_points[base_idx].copy()
 
-        # Compute tip deflection relative to straight MSCR
-        straight_tip = self.mscr_base + tangent * L_MSCR
+        # Entry direction at the base (tangent of the path at the base point)
+        if base_idx >= 1:
+            entry_dir = self.path_points[base_idx] - self.path_points[base_idx - 1]
+        elif base_idx < len(self.path_points) - 1:
+            entry_dir = self.path_points[base_idx + 1] - self.path_points[base_idx]
+        else:
+            entry_dir = np.array([0, 0, 1.0])
+        enorm = np.linalg.norm(entry_dir)
+        if enorm > 1e-6:
+            entry_dir /= enorm
+        else:
+            entry_dir = np.array([0, 0, 1.0])
+
+        # Straight tip = where the tip would be if the MSCR didn't bend
+        straight_tip = self.mscr_base + entry_dir * L_MSCR
         deflection_mm = self.current_pos - straight_tip
 
         # If deflection is essentially zero, inject small perturbation for NN
@@ -385,6 +411,55 @@ class LungNavigationSim:
         self.hist_magX.append(self.magnet_pos[0])
         self.hist_magY.append(self.magnet_pos[1])
         self.hist_magZ.append(self.magnet_pos[2])
+
+    # ── UR5e arm IK ────────────────────────────────────────────────────────
+
+    def _compute_ur5e_joints(self, ee_pos):
+        """
+        Compute simplified 3-link UR5e joint positions via analytic IK.
+        Returns list of 4 points: [base, shoulder, elbow, wrist/EE].
+        """
+        base = self.ur5e_base.copy()
+        L1, L2, L3 = self.ur5e_links
+
+        # Vector from base to end-effector
+        d = ee_pos - base
+        reach = np.linalg.norm(d)
+        total_arm = L1 + L2 + L3
+
+        # If target is beyond reach, scale to maximum
+        if reach > total_arm * 0.98:
+            d = d / reach * total_arm * 0.98
+            reach = total_arm * 0.98
+
+        d_hat = d / reach if reach > 1e-6 else np.array([1, 0, 0])
+
+        # Wrist position: back off L3 from EE along direction
+        wrist = base + d * (1.0 - L3 / total_arm)
+
+        # 2-link IK for shoulder -> elbow -> wrist
+        dw = wrist - base
+        rw = np.linalg.norm(dw)
+        if rw < 1e-6:
+            rw = 1.0
+            dw = np.array([1, 0, 0])
+
+        # Clamp for acos
+        cos_angle = np.clip((L1**2 + rw**2 - L2**2) / (2 * L1 * rw), -1, 1)
+        angle_at_base = np.arccos(cos_angle)
+
+        # Build a perpendicular vector for the elbow bend plane
+        up = np.array([0, 0, 1.0])
+        perp = np.cross(dw, up)
+        if np.linalg.norm(perp) < 1e-6:
+            perp = np.cross(dw, np.array([0, 1, 0]))
+        perp = perp / np.linalg.norm(perp)
+
+        # Elbow position
+        dw_hat = dw / rw
+        elbow = base + dw_hat * (L1 * np.cos(angle_at_base)) + perp * (L1 * np.sin(angle_at_base))
+
+        return [base, elbow, wrist, ee_pos]
 
     # ── Plotting ─────────────────────────────────────────────────────────────
 
@@ -422,9 +497,26 @@ class LungNavigationSim:
         ax.scatter(*self.current_pos, color='red', s=100, zorder=5,
                    depthshade=False, label='MSCR tip')
 
-        # Magnet (UR5e end-effector)
+        # UR5e robot arm (simplified 3-link IK)
+        joints = self._compute_ur5e_joints(self.magnet_pos)
+        # Draw links
+        for i in range(len(joints) - 1):
+            ax.plot([joints[i][0], joints[i + 1][0]],
+                    [joints[i][1], joints[i + 1][1]],
+                    [joints[i][2], joints[i + 1][2]],
+                    color='dimgray', linewidth=5, solid_capstyle='round')
+        # Draw joints
+        jx = [j[0] for j in joints]
+        jy = [j[1] for j in joints]
+        jz = [j[2] for j in joints]
+        ax.scatter(jx, jy, jz, color='orange', s=80, zorder=6,
+                   depthshade=False, edgecolors='black', linewidths=0.5)
+        # UR5e base marker
+        ax.scatter(*joints[0], color='slategray', s=180, marker='s',
+                   zorder=6, depthshade=False, label='UR5e base')
+        # Magnet (end-effector)
         ax.scatter(*self.magnet_pos, color='black', s=120, marker='D',
-                   zorder=5, depthshade=False, label='UR5e magnet')
+                   zorder=7, depthshade=False, label='UR5e magnet')
 
         # Dashed line: magnet -> tip (magnetic field direction)
         ax.plot([self.magnet_pos[0], self.current_pos[0]],
